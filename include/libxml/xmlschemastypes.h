@@ -19,9 +19,19 @@
 #include <libxml/schemasInternals.h>
 #include <libxml/xmlschemas.h>
 
+#include <stdint.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+typedef struct dt_s {
+    int type;
+    int64_t day_num;
+    int64_t day_frac;
+    int32_t timezone;
+    int has_timezone;
+} dt_s_type;
 
 typedef enum {
     XML_SCHEMA_WHITESPACE_UNKNOWN = 0,
@@ -156,6 +166,12 @@ xmlSchemaCompareDates (xmlSchemaValPtr x, xmlSchemaValPtr y);
 XMLPUBFUN int
 xmlSchemaValidateDuration(xmlSchemaTypePtr type,
 				   const xmlChar *duration, xmlSchemaValPtr *val, int collapse);
+
+XMLPUBFUN int
+tklXmlSchemaDateToDtt(xmlSchemaValType type,
+                    const xmlChar *dateTime, dt_s_type *dst, int collapse);
+XMLPUBFUN int
+tklDttToXmlSchemaDate(const dt_s_type *dtt, xmlChar *buf, int buf_size);
 
 #ifdef __cplusplus
 }

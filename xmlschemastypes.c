@@ -6410,4 +6410,333 @@ xmlSchemaGetValType(xmlSchemaValPtr val)
     return (val->type);
 }
 
+/*
+ * Functions to transform xml date to and from dt_s_type
+ * Tekenlight customization
+ */
+
+#define TKL_TICKS_PER_SEC  1000000LL
+#define TKL_SEC_PER_DAY    86400LL
+#define TKL_TICKS_PER_DAY  (TKL_TICKS_PER_SEC * TKL_SEC_PER_DAY)
+
+static int64_t
+tkl_days_before_year(int64_t year)
+{
+    /*
+     * date.lua day 0 == 0001-01-01.
+     *
+     * Number of days in complete years preceding 'year'.
+     */
+    int64_t y = year - 1;
+
+    return
+        365LL * y +
+        y / 4 -
+        y / 100 +
+        y / 400;
+}
+
+
+static int
+tkl_is_leap_year(int64_t year)
+{
+    return ((year % 4 == 0) &&
+           ((year % 100 != 0) || (year % 400 == 0)));
+}
+
+
+static int64_t
+tkl_day_of_year(int64_t year, int month, int day)
+{
+    static const int days_before_month[] = {
+        0,    /* Jan */
+        31,   /* Feb */
+        59,   /* Mar */
+        90,   /* Apr */
+        120,  /* May */
+        151,  /* Jun */
+        181,  /* Jul */
+        212,  /* Aug */
+        243,  /* Sep */
+        273,  /* Oct */
+        304,  /* Nov */
+        334   /* Dec */
+    };
+
+    int64_t n;
+
+    n = days_before_month[month - 1] + (day - 1);
+    if (month > 2 && tkl_is_leap_year(year))
+        n++;
+
+    return n;
+}
+
+
+static int
+tkl_xml_date_to_dtt(xmlSchemaValType type, const xmlSchemaValDate *src, dt_s_type *dst)
+{
+    int64_t sec;
+    int64_t ticks;
+
+    if (src == NULL || dst == NULL)
+        return -1;
+
+    dst->type = (int) type;
+
+    /*
+     * date.lua:
+     *
+     *     daynum == 0  => 0001-01-01
+     */
+    dst->day_num = tkl_days_before_year((int64_t) src->year) +
+                    tkl_day_of_year((int64_t) src->year, (int) src->mon, (int) src->day);
+    /*
+     * Preserve the date.lua dayfrc convention:
+     *
+     * ((hour * 60 + min) * 60 + sec) * TICKS_PER_SEC
+     *     + fractional_ticks
+     */
+    sec = (int64_t) src->sec;
+
+    ticks = (int64_t) ((src->sec - (double) sec) * (double) TKL_TICKS_PER_SEC);
+
+    dst->day_frac = ((((int64_t) src->hour * 60LL) + (int64_t) src->min) * 60LL + sec) * TKL_TICKS_PER_SEC + ticks;
+
+    if (src->tz_flag) {
+        dst->timezone = (int32_t) src->tzo;
+        dst->has_timezone = 1;
+    }
+    else {
+        dst->timezone = 0;
+        dst->has_timezone = 0;
+    }
+
+    return 0;
+}
+
+/**
+ * tklXmlSchemaDateToDtt:
+ * @type: the expected type or XML_SCHEMAS_UNKNOWN
+ * @dateTime:  string to analyze
+ * @dst:  pre-allocated pointer to dt_s_type to which output will be written
+ *
+ * Check that @dateTime conforms to the lexical space of one of the date types.
+ * if true a value is computed and returned in @dst.
+ *
+ * Returns 0 if this validates, a positive error code number otherwise
+ *         and -1 in case of internal or API error.
+ */
+int
+tklXmlSchemaDateToDtt(xmlSchemaValType type, const xmlChar *dateTime, dt_s_type *dst, int collapse)
+{
+    xmlSchemaValPtr val = NULL;
+    int rc;
+
+    if (dateTime == NULL || dst == NULL)
+        return -1;
+
+    rc = xmlSchemaValidateDates(type, dateTime, &val, collapse);
+    if (rc != 0)
+        return rc;
+
+    rc = tkl_xml_date_to_dtt(type, &val->value.date, dst);
+    xmlSchemaFreeValue(val);
+
+    return rc;
+}
+
+#define TKL_TICKS_PER_SEC   1000000LL
+#define TKL_TICKS_PER_MIN   60000000LL
+#define TKL_TICKS_PER_HOUR  3600000000LL
+#define TKL_TICKS_PER_DAY   86400000000LL
+
+/*
+ * Convert dt_s_type day_num to Gregorian year/month/day.
+ *
+ * day_num == 0 -> 0001-01-01
+ */
+static int
+tklDttBreakDayNum(int64_t day_num, int64_t *year, int *month, int *day)
+{
+    int64_t z;
+    int64_t era;
+    unsigned doe;
+    unsigned yoe;
+    int64_t y;
+    unsigned doy;
+    unsigned mp;
+    unsigned d;
+    unsigned m;
+
+    /*
+     * Howard Hinnant civil-from-days algorithm.
+     *
+     * Convert our epoch:
+     *     0001-01-01 == 0
+     *
+     * to the algorithm's epoch:
+     *     1970-01-01 == 0
+     *
+     * 0001-01-01 -> 1970-01-01 = 719162 days.
+     */
+    z = day_num - 719162;
+
+    /*
+     * civil_from_days() internally shifts the Unix epoch
+     * to 0000-03-01.
+     */
+    z += 719468;
+
+    era = (z >= 0 ? z : z - 146096) / 146097;
+    doe = (unsigned)(z - era * 146097);
+
+    yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+
+    y = (int64_t)yoe + era * 400;
+
+    doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+
+    mp = (5 * doy + 2) / 153;
+
+    d = doy - (153 * mp + 2) / 5 + 1;
+
+    m = mp + (mp < 10 ? 3 : -9);
+
+    y += (m <= 2);
+
+    *year = y;
+    *month = (int)m;
+    *day = (int)d;
+
+    return 0;
+}
+
+static int
+tklDttBreakDayFrac(int64_t day_frac, int *hour, int *minute, int *second, int *microsecond)
+{
+    if ((day_frac < 0) || (day_frac >= TKL_TICKS_PER_DAY))
+        return -1;
+
+    *hour = (int)(day_frac / TKL_TICKS_PER_HOUR);
+    day_frac %= TKL_TICKS_PER_HOUR;
+
+    *minute = (int)(day_frac / TKL_TICKS_PER_MIN);
+    day_frac %= TKL_TICKS_PER_MIN;
+
+    *second = (int)(day_frac / TKL_TICKS_PER_SEC);
+    *microsecond = (int)(day_frac % TKL_TICKS_PER_SEC);
+
+    return 0;
+}
+
+int
+tklDttToXmlSchemaDate(const dt_s_type *dtt, xmlChar *buf, int buf_size)
+{
+    int64_t year;
+    int month;
+    int day;
+    int hour;
+    int minute;
+    int second;
+    int usec;
+    int n;
+    int pos = 0;
+
+    if ((dtt == NULL) || (buf == NULL) || (buf_size <= 0))
+        return -1;
+
+    if (tklDttBreakDayNum(dtt->day_num, &year, &month, &day) != 0)
+        return -1;
+
+    if (tklDttBreakDayFrac(dtt->day_frac, &hour, &minute, &second, &usec) != 0)
+        return -1;
+
+    /*
+     * These names must correspond to the actual xmlSchemaValType
+     * constants used by your libxml2 version.
+     */
+    switch (dtt->type) {
+        case XML_SCHEMAS_DATE:
+            n = snprintf((char *)buf, (size_t)buf_size, "%04lld-%02d-%02d",
+                (long long)year,
+                month,
+                day
+            );
+            break;
+        case XML_SCHEMAS_DATETIME:
+            n = snprintf((char *)buf, (size_t)buf_size, "%04lld-%02d-%02dT%02d:%02d:%02d",
+                (long long)year,
+                month,
+                day,
+                hour,
+                minute,
+                second
+            );
+            break;
+        case XML_SCHEMAS_TIME:
+            n = snprintf((char *)buf, (size_t)buf_size, "%02d:%02d:%02d",
+                hour,
+                minute,
+                second
+            );
+            break;
+        default:
+            return -1;
+    }
+
+    if ((n < 0) || (n >= buf_size))
+        return -1;
+
+    pos = n;
+
+    /*
+     * Match the current date_utils behaviour:
+     * milliseconds are emitted, including .000.
+     *
+     * Current Lua representation has microsecond ticks, but the
+     * existing XML formatting path is effectively millisecond based.
+     */
+    if ((dtt->type == XML_SCHEMAS_DATETIME) ||
+        (dtt->type == XML_SCHEMAS_TIME)) {
+        int millis = usec / 1000;
+        n = snprintf((char *)buf + pos, (size_t)(buf_size - pos), ".%03d", millis);
+        if ((n < 0) || (n >= (buf_size - pos)))
+            return -1;
+        pos += n;
+    }
+
+    /*
+     * Timezone.
+     *
+     * timezone is minutes:
+     *     +05:30 -> 330
+     *     -05:00 -> -300
+     */
+    if (dtt->has_timezone) {
+        int tzo = dtt->timezone;
+        if (tzo == 0) {
+            if (pos + 1 >= buf_size)
+                return -1;
+            buf[pos++] = 'Z';
+            buf[pos] = 0;
+        } else {
+            char sign;
+            int abs_tzo;
+            int tz_hour;
+            int tz_min;
+            sign = (tzo < 0) ? '-' : '+';
+            abs_tzo = (tzo < 0) ? -tzo : tzo;
+            tz_hour = abs_tzo / 60;
+            tz_min = abs_tzo % 60;
+            n = snprintf((char *)buf + pos, (size_t)(buf_size - pos), "%c%02d:%02d", sign, tz_hour, tz_min);
+            if ((n < 0) || (n >= (buf_size - pos)))
+                return -1;
+            pos += n;
+        }
+    }
+
+    return pos;
+}
+
 #endif /* LIBXML_SCHEMAS_ENABLED */
